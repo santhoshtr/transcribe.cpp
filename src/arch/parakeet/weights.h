@@ -58,6 +58,15 @@ struct ParakeetHParams {
     int32_t enc_conv_kernel          = 0;  // depthwise conv kernel inside the Conformer block
     int32_t enc_subsampling_factor   = 0;  // total downsampling on the time axis
     int32_t enc_subsampling_channels = 0;  // intermediate channel count in pre_encode
+    // pre_encode kind (stt.parakeet.encoder.subsampling string KV; absent =
+    // dw_striding). Each kind has one factor, validated at load:
+    //   DwStriding — FastConformer: conv0 + 2 depthwise-separable pairs, 8x.
+    //   Striding   — classic Conformer: conv0 + one full conv (conv2), 4x
+    //     (koyal-ml-120m-1.0).
+    enum class PreEncodeKind { DwStriding, Striding };
+    PreEncodeKind enc_pre_encode_kind = PreEncodeKind::DwStriding;
+    // Number of stride-2 conv stages in pre_encode (3 or 2).
+    int pre_encode_stages() const { return enc_pre_encode_kind == PreEncodeKind::Striding ? 2 : 3; }
     int32_t enc_pos_emb_max_len      = 0;
     bool    enc_use_bias             = false;
     // NeMo's RelPositionalEncoding multiplies x by sqrt(d_model) when
@@ -183,6 +192,16 @@ struct ParakeetHParams {
     // Transformers uses the same floor-derived valid lengths, but clears
     // the pointwise bias on padded frames before the next strided conv.
     bool mask_after_pointwise   = false;
+    // nemo_length_masking: NeMo's MaskedConvSequential at every batch size.
+    // Valid lengths from n_samples / hop (NeMo's get_seq_len), masks after
+    // each stage's ReLU and on attention, and decode stops at the valid
+    // length. None of kestrel's other conventions. KV length_masking =
+    // "nemo" (koyal-ml-120m-1.0, where the 4x subsampler otherwise turns
+    // the zeroed trailing mel frame into a real encoder frame).
+    bool nemo_length_masking    = false;
+    // Valid lengths from n_samples / hop and masks on every run, batched
+    // or not (kestrel, transformers or nemo masking).
+    bool masks_every_run() const { return kestrel_length_masking || nemo_length_masking; }
 
     // Speech head on the subsampler output and the long-form pause
     // segmenter it drives. has_vad_head is set when stt.parakeet.vad.hidden
@@ -265,9 +284,11 @@ struct ParakeetPreEncode {
     // dw_striding subsampling: 1 standard conv + 2 depthwise-separable
     // conv pairs = 8x time downsampling. Indices follow NeMo's
     // torch.nn.Sequential (1 and 4 are activation modules, skipped).
+    // striding subsampling (PreEncodeKind::Striding): conv0 and conv2 only,
+    // both full convs (conv2 in=channels); conv3/5/6 stay null.
     ggml_tensor * conv0_w = nullptr;  // [out=channels,        in=1,        kh=3, kw=3]
     ggml_tensor * conv0_b = nullptr;  // [channels]
-    ggml_tensor * conv2_w = nullptr;  // [out=channels,        in=1 (dw),   kh=3, kw=3]
+    ggml_tensor * conv2_w = nullptr;  // [out=channels,        in=1 (dw) or channels (striding), kh=3, kw=3]
     ggml_tensor * conv2_b = nullptr;  // [channels]
     ggml_tensor * conv3_w = nullptr;  // [out=channels,        in=channels, kh=1, kw=1]
     ggml_tensor * conv3_b = nullptr;  // [channels]

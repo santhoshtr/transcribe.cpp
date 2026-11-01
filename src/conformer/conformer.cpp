@@ -1134,6 +1134,61 @@ ggml_tensor * name_prefixed(ggml_tensor * t, const char * prefix, const char * s
     return t;
 }
 
+// Final pre_encode step shared by both subsampling kinds: flatten the conv
+// stack's [F', T_enc, C, B] output into [F'*C, T_enc, B] and project it to
+// d_model. Returns nullptr on a pre_encode_in / out_w shape mismatch.
+ggml_tensor * pre_encode_flatten_project(ggml_context *        ctx,
+                                         ggml_tensor *         x,
+                                         const PreEncodeView & pe,
+                                         const char *          name_prefix,
+                                         const char *          error_tag) {
+    // At this point ne = [F', T_enc, channels, B] (dw_striding: F'=16,
+    // channels=256, T_enc = floor(T_mel / 8)). Flatten (F', C) into one
+    // feature axis matching pre_encode_in = channels * F'.
+    // The reference uses flat index = c*F' + f' (C slow, F' fast), which in
+    // ggml ne is: permute F' to axis 0, C to axis 1, then collapse 0 and 1:
+    //   permute (0, 2, 1, 3): [F', T, C, 1] -> [F', C, T, 1]
+    //   ggml_cont; reshape -> [F'*C, T] = [pre_encode_in, T_enc]
+    const int64_t F_prime       = x->ne[0];
+    const int64_t T_enc         = x->ne[1];
+    const int64_t C             = x->ne[2];
+    // Utterance batch rides the conv "N" axis (ne[3]) through the stem; the
+    // flatten + linear below land it on ne[2] == B for the conformer blocks.
+    const int64_t B             = x->ne[3];
+    const int64_t pre_encode_in = F_prime * C;
+
+    // Sanity check: the linear layer expects exactly pre_encode_in features.
+    if (pe.out_w != nullptr && pre_encode_in != pe.out_w->ne[0]) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                "%s encoder: pre_encode_in mismatch: "
+                "F'*C=%lld but out_w expects %lld",
+                error_tag != nullptr ? error_tag : "conformer", static_cast<long long>(pre_encode_in),
+                static_cast<long long>(pe.out_w->ne[0]));
+        return nullptr;
+    }
+
+    x = ggml_permute(ctx, x, /*axis0=*/0, /*axis1=*/2,
+                     /*axis2=*/1, /*axis3=*/3);
+    x = name_prefixed(x, name_prefix, "permuted");
+    x = ggml_cont(ctx, x);
+    x = name_prefixed(x, name_prefix, "flat_pre");
+    // [F', C, T_enc, B] -> [F'*C, T_enc, B]. B at ne[2] after the collapse.
+    x = ggml_reshape_3d(ctx, x, pre_encode_in, T_enc, B);
+    x = name_prefixed(x, name_prefix, "flat");
+
+    // Linear projection to d_model (out_w ne=[pre_encode_in, d_model]).
+    x = ggml_mul_mat(ctx, pe.out_w, x);
+    x = name_prefixed(x, name_prefix, "linear");
+
+    // Add bias [d_model], broadcast to [d_model, T_enc, 1, 1].
+    if (pe.out_b != nullptr) {
+        const int64_t d_model = pe.out_b->ne[0];
+        ggml_tensor * bias_4d = ggml_reshape_4d(ctx, pe.out_b, d_model, 1, 1, 1);
+        x                     = ggml_add(ctx, x, bias_4d);
+    }
+    return name_prefixed(x, name_prefix, "out");
+}
+
 }  // namespace
 
 // Pre-encode subsampling stack. Op order matches NeMo's
@@ -1145,6 +1200,12 @@ ggml_tensor * name_prefixed(ggml_tensor * t, const char * prefix, const char * s
 //   permute + cont + reshape to flatten freq*channels into a single
 //   feature axis matching `pre_encode_in = channels * (n_mels / 8)`
 //   linear (out_w, out_b) -> [d_model, T_enc, 1, 1]
+//
+// With policy.striding_pre_encode (NeMo `striding`, classic Conformer) the
+// stack after conv0 is one full conv instead of the two separable pairs:
+//
+//   conv2 (standard, C->C, k=3 s=2 p=1)  -> bias -> ReLU
+//   flatten (pre_encode_in = channels * (n_mels / 4)) -> linear
 //
 // Each conv's fused bias is an explicit ggml_add (no-op when null). The 2-D
 // depthwise convs (conv2, conv5) honor policy.direct_dw_in_pre_encode.
@@ -1244,6 +1305,22 @@ ggml_tensor * build_pre_encode(ggml_context *        ctx,
     x = apply_valid_mask(x, valid_masks ? &valid_masks->mask_s1 : nullptr, "pre_encode.valid_mask.s1");
     x = zero_causal_tail(x);
 
+    if (policy.striding_pre_encode) {
+        // conv2 (standard 2D conv: channels -> channels, k=3 s=2). Direct
+        // conv, as conv0: im2col would materialize C*9 values per output
+        // position. Offline only (the caller rejects causal pre_encode).
+        x = ggml_conv_2d_direct(ctx, pe.conv2_w, x,
+                                /*s0=*/2, /*s1=*/2,
+                                /*p0=*/pe_p_op, /*p1=*/pe_p_op,
+                                /*d0=*/1, /*d1=*/1);
+        x = add_conv_bias(ctx, x, pe.conv2_b);
+        x = name_prefixed(x, name_prefix, "conv2");
+        x = ggml_relu(ctx, x);
+        x = name_prefixed(x, name_prefix, "relu2");
+        x = apply_valid_mask(x, valid_masks ? &valid_masks->mask_s2 : nullptr, "pre_encode.valid_mask.s2");
+        return pre_encode_flatten_project(ctx, x, pe, name_prefix, error_tag);
+    }
+
     // conv2 (depthwise: channels -> channels, groups=channels, k=3 s=2).
     // im2col path (conv_2d_dw_f32) when direct_dw_in_pre_encode is false.
     if (policy.direct_dw_in_pre_encode) {
@@ -1326,53 +1403,7 @@ ggml_tensor * build_pre_encode(ggml_context *        ctx,
         }
     }
 
-    // At this point ne = [F'=16, T_enc, channels=256, 1] where
-    // T_enc = floor(T_mel / 8). Flatten (F', C) into one feature axis
-    // matching pre_encode_in = channels * (n_mels / subsampling_factor).
-    // The reference uses flat index = c*F' + f' (C slow, F' fast), which in
-    // ggml ne is: permute F' to axis 0, C to axis 1, then collapse 0 and 1:
-    //   permute (0, 2, 1, 3): [F', T, C, 1] -> [F', C, T, 1]
-    //   ggml_cont; reshape -> [F'*C, T] = [pre_encode_in, T_enc]
-    const int64_t F_prime       = x->ne[0];
-    const int64_t T_enc         = x->ne[1];
-    const int64_t C             = x->ne[2];
-    // Utterance batch rides the conv "N" axis (ne[3]) through the stem; the
-    // flatten + linear below land it on ne[2] == B for the conformer blocks.
-    const int64_t B             = x->ne[3];
-    const int64_t pre_encode_in = F_prime * C;
-
-    // Sanity check: the linear layer expects exactly pre_encode_in features.
-    if (pe.out_w != nullptr && pre_encode_in != pe.out_w->ne[0]) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                "%s encoder: pre_encode_in mismatch: "
-                "F'*C=%lld but out_w expects %lld",
-                error_tag != nullptr ? error_tag : "conformer", static_cast<long long>(pre_encode_in),
-                static_cast<long long>(pe.out_w->ne[0]));
-        return nullptr;
-    }
-
-    x = ggml_permute(ctx, x, /*axis0=*/0, /*axis1=*/2,
-                     /*axis2=*/1, /*axis3=*/3);
-    x = name_prefixed(x, name_prefix, "permuted");
-    x = ggml_cont(ctx, x);
-    x = name_prefixed(x, name_prefix, "flat_pre");
-    // [F', C, T_enc, B] -> [F'*C, T_enc, B]. B at ne[2] after the collapse.
-    x = ggml_reshape_3d(ctx, x, pre_encode_in, T_enc, B);
-    x = name_prefixed(x, name_prefix, "flat");
-
-    // Linear projection to d_model (out_w ne=[pre_encode_in, d_model]).
-    x = ggml_mul_mat(ctx, pe.out_w, x);
-    x = name_prefixed(x, name_prefix, "linear");
-
-    // Add bias [d_model], broadcast to [d_model, T_enc, 1, 1].
-    if (pe.out_b != nullptr) {
-        const int64_t d_model = pe.out_b->ne[0];
-        ggml_tensor * bias_4d = ggml_reshape_4d(ctx, pe.out_b, d_model, 1, 1, 1);
-        x                     = ggml_add(ctx, x, bias_4d);
-    }
-    x = name_prefixed(x, name_prefix, "out");
-
-    return x;
+    return pre_encode_flatten_project(ctx, x, pe, name_prefix, error_tag);
 }
 
 }  // namespace transcribe::conformer

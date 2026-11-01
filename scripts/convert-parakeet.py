@@ -339,6 +339,28 @@ VARIANT_PROFILES: dict[str, dict] = {
         "license_name": "Creative Commons Attribution 4.0",
         "license_link": "https://creativecommons.org/licenses/by/4.0/",
     },
+    # Adalat AI Koyal Malayalam 120M: hybrid TDT+CTC on a classic
+    # Conformer encoder (17L / d_model=512 / kernel=31), warm-started
+    # from AI4Bharat MahaDhwani. Its pre_encode is NeMo `striding`
+    # (two full k=3 s=2 convs, 4x), not FastConformer `dw_striding`.
+    # Same TDT-only shipping decision as the other hybrids.
+    "koyal-ml-120m-1.0": {
+        "variant": "koyal-ml-120m-1.0",
+        "display_name": "Koyal Malayalam 120M",
+        "version": "v1",
+        "size_label": "120M",
+        "head_kind": "tdt",
+        "expected_vocab_size": 512,
+        "languages": ["ml"],
+        "lang_detect": False,
+        # NeMo's MaskedConvSequential masks at every batch size from
+        # n_samples / hop. At 4x, one clip length in four otherwise gets
+        # a real-looking encoder frame from the zeroed trailing mel frame.
+        "length_masking": "nemo",
+        "license": "cc-by-4.0",
+        "license_name": "Creative Commons Attribution 4.0",
+        "license_link": "https://creativecommons.org/licenses/by/4.0/",
+    },
     # 1.1B English hybrid TDT+CTC. Same TDT-only shipping decision.
     # Marked `prefer_direct_load=True` so the converter bypasses
     # NeMo's restore_from() extraction (~4.4 GB transient disk) and
@@ -1145,14 +1167,31 @@ def read_hparams(config: dict) -> dict:
             f"converter only handles AudioToMelSpectrogramPreprocessor"
         )
 
+    # pre_encode kind. The runtime implements two NeMo ConvSubsampling
+    # modes, each at one factor: dw_striding (FastConformer, 8x) and
+    # striding (classic Conformer, 4x). ConvSubsampling defaults to
+    # dw_striding when the cfg omits it.
+    subsampling        = str(enc.get("subsampling", "dw_striding"))
+    subsampling_factor = int(enc["subsampling_factor"])
+    if (subsampling, subsampling_factor) not in (("dw_striding", 8), ("striding", 4)):
+        raise ValueError(
+            f"unsupported pre_encode: subsampling={subsampling!r} "
+            f"factor={subsampling_factor}; supported: dw_striding/8, striding/4"
+        )
+    # NeMo resolves subsampling_conv_channels=-1 to d_model.
+    subsampling_channels = int(enc["subsampling_conv_channels"])
+    if subsampling_channels == -1:
+        subsampling_channels = int(enc["d_model"])
+
     return {
         "enc_n_layers":             int(enc["n_layers"]),
         "enc_d_model":              int(enc["d_model"]),
         "enc_n_heads":              int(enc["n_heads"]),
         "enc_d_ff":                 int(enc["d_model"]) * int(enc["ff_expansion_factor"]),
         "enc_conv_kernel":          int(enc["conv_kernel_size"]),
-        "enc_subsampling_factor":   int(enc["subsampling_factor"]),
-        "enc_subsampling_channels": int(enc["subsampling_conv_channels"]),
+        "enc_subsampling":          subsampling,
+        "enc_subsampling_factor":   subsampling_factor,
+        "enc_subsampling_channels": subsampling_channels,
         "enc_pos_emb_max_len":      int(enc["pos_emb_max_len"]),
         # xscaling: NeMo's RelPositionalEncoding multiplies x by
         # sqrt(d_model) before generating pos_emb when this flag is
@@ -1855,6 +1894,10 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
     writer.add_uint32("stt.parakeet.encoder.n_heads",              hp["enc_n_heads"])
     writer.add_uint32("stt.parakeet.encoder.d_ff",                 hp["enc_d_ff"])
     writer.add_uint32("stt.parakeet.encoder.conv_kernel",          hp["enc_conv_kernel"])
+    # Written only for the non-default kind, so dw_striding GGUFs stay
+    # byte-identical; the loader treats an absent key as dw_striding.
+    if hp.get("enc_subsampling", "dw_striding") != "dw_striding":
+        writer.add_string("stt.parakeet.encoder.subsampling", hp["enc_subsampling"])
     writer.add_uint32("stt.parakeet.encoder.subsampling_factor",   hp["enc_subsampling_factor"])
     writer.add_uint32("stt.parakeet.encoder.subsampling_channels", hp["enc_subsampling_channels"])
     writer.add_uint32("stt.parakeet.encoder.pos_emb_max_len",      hp["enc_pos_emb_max_len"])
@@ -2029,6 +2072,8 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
     elif profile.get("transformers_runtime"):
         writer.add_string("stt.parakeet.encoder.length_masking", "transformers")
         writer.add_string("stt.parakeet.tdt.symbol_budget", "global")
+    elif profile.get("length_masking"):
+        writer.add_string("stt.parakeet.encoder.length_masking", profile["length_masking"])
 
     # VAD head shape from the checkpoint; segmenter constants are kestrel's
     # runtime policy, written here so the C++ does not hard-code a copy.
@@ -2092,8 +2137,14 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
         bytes_out += int(arr.nbytes)
         n_added += 1
 
-    # pre_encode
+    # pre_encode. striding has only conv.0 and conv.2 (both full convs);
+    # conv.3 / .5 / .6 are dw_striding's depthwise-separable pairs.
+    striding = hp.get("enc_subsampling", "dw_striding") == "striding"
     for nemo_name, gguf_name in PRE_ENCODE_TABLE:
+        if striding and nemo_name.startswith(("encoder.pre_encode.conv.3.",
+                                              "encoder.pre_encode.conv.5.",
+                                              "encoder.pre_encode.conv.6.")):
+            continue
         add(nemo_name, gguf_name)
 
     # encoder layers
@@ -2190,8 +2241,10 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
     else:
         spk_tensors = 0
     vad_tensors = len(VAD_HEAD_TABLE) if has_vad_head else 0
+    # striding skips conv.3 / .5 / .6 (weight + bias each).
+    pre_encode_tensors = len(PRE_ENCODE_TABLE) - (6 if striding else 0)
     expected = (
-        len(PRE_ENCODE_TABLE)
+        pre_encode_tensors
         + hp["enc_n_layers"] * per_layer_tensors
         + head_tensors
         + prompt_tensors

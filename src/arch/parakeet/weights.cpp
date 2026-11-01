@@ -67,6 +67,33 @@ transcribe_status read_parakeet_hparams(const gguf_context * gguf, ParakeetHPara
         st != TRANSCRIBE_OK) {
         return st;
     }
+    // pre_encode kind. Optional KV, default "dw_striding" for every GGUF
+    // written before striding support. striding is implemented at 4x only;
+    // the encoder checks the dw_striding factor (8) at graph build.
+    {
+        std::string kind;
+        if (auto st = read_optional_string_kv(gguf, "stt.parakeet.encoder.subsampling", kFamilyTag, "dw_striding",
+                                              kind);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        if (kind == "dw_striding") {
+            hp.enc_pre_encode_kind = ParakeetHParams::PreEncodeKind::DwStriding;
+        } else if (kind == "striding") {
+            hp.enc_pre_encode_kind = ParakeetHParams::PreEncodeKind::Striding;
+            if (hp.enc_subsampling_factor != 4) {
+                log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                        "parakeet: encoder.subsampling \"striding\" needs subsampling_factor=4, got %d",
+                        hp.enc_subsampling_factor);
+                return TRANSCRIBE_ERR_GGUF;
+            }
+        } else {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                    "parakeet: unsupported encoder.subsampling \"%s\" (allowed: dw_striding, striding)",
+                    kind.c_str());
+            return TRANSCRIBE_ERR_GGUF;
+        }
+    }
     if (auto st =
             read_required_u32_kv(gguf, "stt.parakeet.encoder.pos_emb_max_len", kFamilyTag, hp.enc_pos_emb_max_len);
         st != TRANSCRIBE_OK) {
@@ -508,12 +535,13 @@ transcribe_status read_parakeet_hparams(const gguf_context * gguf, ParakeetHPara
             st != TRANSCRIBE_OK) {
             return st;
         }
-        if (masking != "none" && masking != "kestrel" && masking != "transformers") {
+        if (masking != "none" && masking != "kestrel" && masking != "transformers" && masking != "nemo") {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet: unsupported encoder.length_masking \"%s\"", masking.c_str());
             return TRANSCRIBE_ERR_GGUF;
         }
-        hp.kestrel_length_masking = (masking != "none");
+        hp.kestrel_length_masking = (masking == "kestrel" || masking == "transformers");
         hp.mask_after_pointwise   = (masking == "transformers");
+        hp.nemo_length_masking    = (masking == "nemo");
 
         std::string budget;
         if (auto st = read_optional_string_kv(gguf, "stt.parakeet.tdt.symbol_budget", kFamilyTag, "per_frame", budget);
@@ -539,7 +567,9 @@ transcribe_status read_parakeet_hparams(const gguf_context * gguf, ParakeetHPara
     // ships with. kestrel-masked checkpoints (parakeet-ultra) keep full
     // attention: they cut long audio at pauses and their contract is
     // kestrel's output. The streaming styles keep their trained menus.
-    constexpr int kLongformAttContext = 256;
+    // The window is 256 frames at 8x subsampling; a 4x encoder (striding,
+    // 40 ms frames) gets 512 so it still covers 20.5 s exactly.
+    const int kLongformAttContext = hp.enc_pre_encode_kind == ParakeetHParams::PreEncodeKind::Striding ? 512 : 256;
     if (hp.enc_att_context_style == ParakeetHParams::AttContextStyle::Regular && hp.enc_att_context_left < 0 &&
         hp.enc_att_context_right < 0 && !hp.kestrel_length_masking) {
         hp.enc_att_context_left  = kLongformAttContext;
@@ -880,8 +910,9 @@ transcribe_status build_parakeet_weights(ggml_context *          ctx_meta,
     const int64_t joint_n  = hp.joint_n_classes();  // meaningless for CTC; we read CTC head shape instead
 
     // The flattened "freq" axis into pre_encode.out is
-    // (subsampling_channels * F'), where F' is the freq dim after three
-    // k=3 s=2 convs. Padding tracks NeMo's causal_downsampling (inferred
+    // (subsampling_channels * F'), where F' is the freq dim after the
+    // k=3 s=2 convs (three for dw_striding, two for striding: 80→40→20;
+    // 512*20=10240 on koyal-ml-120m-1.0). Padding tracks NeMo's causal_downsampling (inferred
     // from the attention style — only ChunkedLimited is causal), NOT the
     // conformer conv_context_size:
     //   non-causal: symmetric (k-1)/2 both sides. 128→64→32→16; 256*16=4096.
@@ -893,7 +924,7 @@ transcribe_status build_parakeet_weights(ggml_context *          ctx_meta,
         // (k-1) + (s-1) = 3 for causal.
         const int  total_pad = causal ? ((k - 1) + (s - 1)) : ((k - 1) / 2 + (k - 1) / 2);
         int        dim       = hp.fe_num_mels;
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < hp.pre_encode_stages(); ++i) {
             dim = ((dim + total_pad - k) / s) + 1;
         }
         return static_cast<int64_t>(dim);
@@ -907,14 +938,19 @@ transcribe_status build_parakeet_weights(ggml_context *          ctx_meta,
     // 1×1 pointwise convs collapse to [1, 1, in, out].
     GET_CONV(weights.pre_encode.conv0_w, "enc.pre_encode.conv.0.weight", 3, 3, 1, channels);
     GET_F32(weights.pre_encode.conv0_b, "enc.pre_encode.conv.0.bias", channels);
-    GET_CONV(weights.pre_encode.conv2_w, "enc.pre_encode.conv.2.weight", 3, 3, 1, channels);
-    GET_F32(weights.pre_encode.conv2_b, "enc.pre_encode.conv.2.bias", channels);
-    GET_CONV(weights.pre_encode.conv3_w, "enc.pre_encode.conv.3.weight", 1, 1, channels, channels);
-    GET_F32(weights.pre_encode.conv3_b, "enc.pre_encode.conv.3.bias", channels);
-    GET_CONV(weights.pre_encode.conv5_w, "enc.pre_encode.conv.5.weight", 3, 3, 1, channels);
-    GET_F32(weights.pre_encode.conv5_b, "enc.pre_encode.conv.5.bias", channels);
-    GET_CONV(weights.pre_encode.conv6_w, "enc.pre_encode.conv.6.weight", 1, 1, channels, channels);
-    GET_F32(weights.pre_encode.conv6_b, "enc.pre_encode.conv.6.bias", channels);
+    if (hp.enc_pre_encode_kind == ParakeetHParams::PreEncodeKind::Striding) {
+        GET_CONV(weights.pre_encode.conv2_w, "enc.pre_encode.conv.2.weight", 3, 3, channels, channels);
+        GET_F32(weights.pre_encode.conv2_b, "enc.pre_encode.conv.2.bias", channels);
+    } else {
+        GET_CONV(weights.pre_encode.conv2_w, "enc.pre_encode.conv.2.weight", 3, 3, 1, channels);
+        GET_F32(weights.pre_encode.conv2_b, "enc.pre_encode.conv.2.bias", channels);
+        GET_CONV(weights.pre_encode.conv3_w, "enc.pre_encode.conv.3.weight", 1, 1, channels, channels);
+        GET_F32(weights.pre_encode.conv3_b, "enc.pre_encode.conv.3.bias", channels);
+        GET_CONV(weights.pre_encode.conv5_w, "enc.pre_encode.conv.5.weight", 3, 3, 1, channels);
+        GET_F32(weights.pre_encode.conv5_b, "enc.pre_encode.conv.5.bias", channels);
+        GET_CONV(weights.pre_encode.conv6_w, "enc.pre_encode.conv.6.weight", 1, 1, channels, channels);
+        GET_F32(weights.pre_encode.conv6_b, "enc.pre_encode.conv.6.bias", channels);
+    }
     GET_LIN(weights.pre_encode.out_w, "enc.pre_encode.out.weight", pre_encode_in, d_model);
     GET_F32(weights.pre_encode.out_b, "enc.pre_encode.out.bias", d_model);
 

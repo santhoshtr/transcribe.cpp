@@ -129,6 +129,11 @@ struct ConvPolicy {
     // Run the pre_encode pointwise convs (conv3, conv6) via conv_2d_f32.
     // Other variants were validated on the F16 im2col and keep it.
     bool pre_encode_f32_pointwise = false;
+
+    // NeMo `striding` subsampling (classic Conformer, 4x): conv0 then one
+    // full k=3 s=2 conv (conv2, C->C); conv3/5/6 are unused. Offline only.
+    // false = DwStridingSubsampling (8x).
+    bool striding_pre_encode = false;
 };
 
 // Resolve a conv-dispatch toggle from its env overrides. The DIRECT var forces
@@ -464,7 +469,8 @@ struct PreEncodeValidMasks {
     ggml_tensor * mask_s3_extent = nullptr;
 };
 
-// DwStridingSubsampling pre_encode stack. Returns the final
+// DwStridingSubsampling pre_encode stack (or StridingSubsampling with
+// policy.striding_pre_encode; then mask_s3 stays null). Returns the final
 // [d_model, T_enc, 1, 1] tensor or nullptr on a shape-sanity failure.
 // `name_prefix` (if non-null) names every intermediate "<prefix>.conv0"
 // etc. Uses pe.out_w->ne[0] as a d_model sanity check; `error_tag` names the
