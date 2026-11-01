@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>transcribe.cpp in the browser</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 48rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  label { display: block; margin: 0.5rem 0; }
+  input[type=text] { width: 100%; box-sizing: border-box; }
+  #status { color: GrayText; min-height: 1.5em; }
+  #text { white-space: pre-wrap; border: 1px solid GrayText; padding: 0.75rem; min-height: 6rem; }
+</style>
+</head>
+<body>
+<h1>Speech to text in the browser</h1>
+<p>The audio stays on this computer. The models download once and stay in
+the browser cache.</p>
+
+<label>ASR model URL <input id="asr" type="text" value="models/koyal-ml-120m-1.0-Q8_0.gguf"></label>
+<label>VAD model URL <input id="vad" type="text" value="models/silero-vad-v6.2-F32.gguf"></label>
+<button id="load">Load models</button>
+
+<label>Audio file <input id="file" type="file" accept="audio/*" disabled></label>
+<button id="rec" disabled>Record</button>
+<p id="status"></p>
+<div id="text"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const worker = new Worker('worker.js');
+const texts = [];
+let loaded = false;
+const setBusy = (busy) => { $('file').disabled = busy; $('rec').disabled = busy; };
+
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === 'status') $('status').textContent = m.text;
+  else if (m.type === 'error') {
+    $('status').textContent = 'Error: ' + m.text;
+    // After a failed transcription, let the user try again.
+    if (loaded) setBusy(false);
+  } else if (m.type === 'loaded') {
+    loaded = true;
+    $('status').textContent = 'Models loaded. Select an audio file or record.';
+    setBusy(false);
+  } else if (m.type === 'chunk') {
+    if (m.text) texts.push(m.text);
+    $('text').textContent = texts.join(' ');
+  } else if (m.type === 'done') {
+    $('status').textContent = `Done in ${(m.ms / 1000).toFixed(1)} s`;
+    setBusy(false);
+  }
+};
+
+$('load').onclick = () => {
+  $('load').disabled = true;
+  worker.postMessage({ type: 'load', asrUrl: $('asr').value, vadUrl: $('vad').value, threads: crossOriginIsolated ? Math.min(8, navigator.hardwareConcurrency) : 1 });
+};
+
+// Decode any audio format the browser knows. decodeAudioData resamples to
+// the sample rate of the context, here 16 kHz. Then mix down to mono.
+async function decode16kMono(blob) {
+  const ctx = new OfflineAudioContext(1, 1, 16000);
+  const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+  const pcm = new Float32Array(buf.length);
+  for (let c = 0; c < buf.numberOfChannels; c++) {
+    const ch = buf.getChannelData(c);
+    for (let i = 0; i < ch.length; i++) pcm[i] += ch[i] / buf.numberOfChannels;
+  }
+  return pcm;
+}
+
+async function transcribeBlob(blob) {
+  setBusy(true);
+  texts.length = 0;
+  $('text').textContent = '';
+  $('status').textContent = 'Decoding audio';
+  try {
+    const pcm = await decode16kMono(blob);
+    $('status').textContent = `Audio: ${(pcm.length / 16000).toFixed(1)} s`;
+    worker.postMessage({ type: 'transcribe', pcm }, [pcm.buffer]);
+  } catch (err) {
+    $('status').textContent = 'Error: ' + err.message;
+    setBusy(false);
+  }
+}
+
+$('file').onchange = () => {
+  const file = $('file').files[0];
+  if (file) transcribeBlob(file);
+};
+
+// MediaRecorder gives compressed audio (webm or mp4, as the browser
+// selects). decode16kMono decodes it as it decodes a file.
+let recorder = null;
+$('rec').onclick = async () => {
+  if (recorder) {
+    recorder.stop();
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    $('status').textContent = 'Error: ' + err.message;
+    return;
+  }
+  const parts = [];
+  recorder = new MediaRecorder(stream);
+  recorder.ondataavailable = (e) => parts.push(e.data);
+  recorder.onstop = () => {
+    stream.getTracks().forEach((t) => t.stop());
+    recorder = null;
+    $('rec').textContent = 'Record';
+    transcribeBlob(new Blob(parts));
+  };
+  recorder.start();
+  $('file').disabled = true;
+  $('rec').textContent = 'Stop';
+  $('status').textContent = 'Recording. Click Stop to transcribe.';
+};
+</script>
+</body>
+</html>
